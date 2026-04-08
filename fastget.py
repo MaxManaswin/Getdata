@@ -56,7 +56,7 @@ async def mqtt_auth(request: Request):
 async def receive_data(request: Request):
     global LAST_SAVE_TIME, latest_data
     payload = await request.json()
-    dev_id = payload.get("dev_id")
+    dev_id = payload.get("dev_id", "STATION_UNKNOWN")
     
     raw_data = {
         "temp": payload.get("temperature"),
@@ -69,11 +69,12 @@ async def receive_data(request: Request):
     }
 
     valid_fields = {}
-    error_fields = {}
+    error_details = []
 
     for key, value in raw_data.items():
         if value is None: continue
             
+        # จับคู่ชื่อ Key กับ SENSOR_LIMITS
         limit_key = {
             "temp": "temperature", "hum": "humidity", 
             "pm25": "pm25", "lux": "lux"
@@ -81,44 +82,55 @@ async def receive_data(request: Request):
 
         if limit_key and limit_key in SENSOR_LIMITS:
             limits = SENSOR_LIMITS[limit_key]
+            # ตรวจสอบค่าว่าอยู่นอกช่วงหรือไม่
             if value < limits["min"] or value > limits["max"]:
-                error_fields[key] = value
-                continue
+                error_details.append({
+                    "sensor": key,
+                    "actual_value": value,
+                    "threshold": limits,
+                    "status": "TOO HIGH" if value > limits["max"] else "TOO LOW"
+                })
+                continue # ข้ามค่านี้ไป ไม่ส่งลง Influx
         
         valid_fields[key] = value
 
-    # บันทึก Error ลง MongoDB
-    if error_fields:
+    # --- บันทึกลง MongoDB: กรณีมีค่าผิดปกติ ---
+    if error_details:
+        print(f"⚠️ [{dev_id}] Found {len(error_details)} invalid fields!")
         incident_col.insert_one({
             "dev_id": dev_id,
             "timestamp": datetime.datetime.now(),
-            "invalid_data": error_fields,
+            "invalid_fields": error_details,  # บอกว่าตัวไหนพัง พังเพราะอะไร
             "raw_payload": payload
         })
 
-    # บันทึกค่าปกติลง InfluxDB และเตรียม Snapshot
+    # --- บันทึกลง InfluxDB: เฉพาะค่าที่ปกติ ---
     if valid_fields:
-        point = Point("weather_station").tag("device_id", dev_id)
-        for key, value in valid_fields.items():
-            point.field(key, float(value))
-        write_api.write(bucket=INFLUX_BUCKET, record=point)
+        try:
+            point = Point("weather_station").tag("device_id", dev_id)
+            for key, value in valid_fields.items():
+                point.field(key, float(value))
+            write_api.write(bucket=INFLUX_BUCKET, record=point)
 
-        latest_data[dev_id] = {
-            "device_id": dev_id,
-            **valid_fields,
-            "timestamp": time.time()
-        }
+            # เก็บไว้ทำ Snapshot 5 นาที
+            latest_data[dev_id] = {
+                "device_id": dev_id,
+                **valid_fields,
+                "timestamp": datetime.datetime.now()
+            }
+        except Exception as e:
+            print(f"❌ InfluxDB Write Error: {e}")
 
-    # บันทึกลง MongoDB ทุก 5 นาที
+    # --- บันทึก Snapshot ลง MongoDB ทุกๆ 5 นาที ---
     if time.time() - LAST_SAVE_TIME >= 300:
         if latest_data:
-            db["device_history"].insert_many(list(latest_data.values()))
-            latest_data = {}
+            history_col.insert_many(list(latest_data.values()))
+            print("💾 5-Minute Snapshot Saved to MongoDB.")
+            latest_data.clear()
             LAST_SAVE_TIME = time.time()
             
-    return {"status": "success"}
+    return {"status": "success", "processed_at": str(datetime.datetime.now())}
 
 if __name__ == '__main__':
     import uvicorn
-    # รันบนพอร์ต 3000 หรือพอร์ตที่อาจารย์อนุญาต (10000-10020)
     uvicorn.run(app, host='0.0.0.0', port=3000)
