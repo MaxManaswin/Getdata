@@ -111,6 +111,7 @@ async def receive_data(request: Request):
             for key, value in valid_fields.items():
                 point.field(key, float(value))
             write_api.write(bucket=INFLUX_BUCKET, record=point)
+            
 
             # เก็บไว้ทำ Snapshot 5 นาที
             latest_data[dev_id] = {
